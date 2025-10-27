@@ -3,10 +3,11 @@
   hosts: localhost
   become: true
   vars:
-    username: "{{ lookup('env', 'USER') }}"
-    llm_root: "/home/{{ lookup('env', 'USER') }}/llm-stack"
+    # pick SUDO_USER when running via sudo, otherwise fallback to USER
+    username: "{{ lookup('env','SUDO_USER') | default(lookup('env','USER')) }}"
+    llm_root: "/home/{{ lookup('env','SUDO_USER') | default(lookup('env','USER')) }}/llm-stack"
     vllm_model: "Qwen/Qwen2.5-7B-Instruct"
-    vllm_api_key: "token-local"
+    vllm_api_key: "token-local"    # WARNING: avoid committing real secrets; use vault or env
     anythingllm_port: 3001
     vllm_port: 8000
     tailscale_authkey: ""   # Set your Tailscale reusable auth key here
@@ -37,14 +38,16 @@
         append: yes
 
     # --- NVIDIA container runtime ---
-    - name: Add NVIDIA container toolkit repo
+    - name: Add NVIDIA container toolkit repo (shell)
       shell: |
+        set -e
         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
           gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit.gpg
         curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
           tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
       args:
         executable: /bin/bash
+      changed_when: false
 
     - name: Install NVIDIA container runtime
       apt:
@@ -54,6 +57,9 @@
 
     - name: Configure NVIDIA runtime
       command: nvidia-ctk runtime configure --runtime=docker
+      register: nvidia_ctk_result
+      changed_when: "'configured' in (nvidia_ctk_result.stdout | lower) or nvidia_ctk_result.rc == 0"
+      failed_when: nvidia_ctk_result.rc != 0 and nvidia_ctk_result.rc is not none
 
     - name: Restart Docker
       service:
@@ -64,12 +70,14 @@
     # --- Tailscale setup ---
     - name: Add Tailscale APT repository
       shell: |
+        set -e
         curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | \
-          tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          tee /usr/share/keyrings/tailscale-archive-keyring.gpg &gt;/dev/null
         curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | \
-          tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+          tee /etc/apt/sources.list.d/tailscale.list &gt;/dev/null
       args:
         executable: /bin/bash
+      changed_when: false
 
     - name: Install Tailscale
       apt:
@@ -117,6 +125,7 @@
         dest: "{{ llm_root }}/docker-compose.yml"
         owner: "{{ username }}"
         content: |
+          version: "3.9"
           services:
             vllm:
               image: vllm/vllm-openai:latest
@@ -124,12 +133,17 @@
                 - "vllm"
                 - "serve"
                 - "{{ vllm_model }}"
-                - "--dtype"; "auto"
-                - "--port"; "{{ vllm_port }}"
-                - "--api-key"; "{{ vllm_api_key }}"
-                - "--max-model-len"; "16000"  # Optimal context window for 3090 (24 GB)
+                - "--dtype"
+                - "auto"
+                - "--port"
+                - "{{ vllm_port }}"
+                - "--api-key"
+                - "{{ vllm_api_key }}"
+                - "--max-model-len"
+                - "16000"
               environment:
                 - NVIDIA_VISIBLE_DEVICES=all
+              deploy: {}
               device_requests:
                 - driver: nvidia
                   count: 1
@@ -167,6 +181,7 @@
           [Service]
           Type=oneshot
           WorkingDirectory={{ llm_root }}
+          Environment=HOME=/home/{{ username }}
           ExecStart=/usr/bin/docker compose up -d
           ExecStop=/usr/bin/docker compose down
           RemainAfterExit=yes
@@ -175,6 +190,7 @@
 
           [Install]
           WantedBy=multi-user.target
+      notify: daemon-reload
 
     - name: Enable and start LLM stack
       systemd:
@@ -196,8 +212,8 @@
         dest: /home/{{ username }}/.xsession
         content: |
           startxfce4
-      owner: "{{ username }}"
-      mode: '0644'
+        owner: "{{ username }}"
+        mode: '0644'
 
     - name: Add xrdp to ssl-cert group
       user:
@@ -211,26 +227,38 @@
         state: started
         enabled: yes
 
-    # --- Shell aliases for convenience ---
+    # --- Shell aliases for convenience (idempotent block) ---
     - name: Add LLM management aliases to .bashrc
-      lineinfile:
+      blockinfile:
         path: "/home/{{ username }}/.bashrc"
-        insertafter: EOF
-        line: "{{ item }}"
-      with_items:
-        - '# Local LLM aliases'
-        - "alias llm-up='cd ~/llm-stack && docker compose up -d'"
-        - "alias llm-down='cd ~/llm-stack && docker compose down'"
-        - "alias llm-logs='cd ~/llm-stack && docker compose logs -f'"
+        create: yes
+        owner: "{{ username }}"
+        mode: '0644'
+        block: |
+          # Local LLM aliases
+          alias llm-up='cd ~/llm-stack &amp;&amp; docker compose up -d'
+          alias llm-down='cd ~/llm-stack &amp;&amp; docker compose down'
+          alias llm-logs='cd ~/llm-stack &amp;&amp; docker compose logs -f'
 
     # --- Firewall rules for LAN + Tailscale only ---
-    - name: Configure UFW
-      shell: |
-        ufw --force reset
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow in on tailscale0
-        ufw allow from 192.168.1.0/24
-        ufw enable
-      args:
-        executable: /bin/bash
+    - name: Warn about UFW reset (do not run automatically)
+      debug:
+        msg: |
+          The playbook contains a UFW reset step. Running "ufw --force reset" may drop existing rules and
+          could lock you out if you're connected remotely. Consider enabling SSH first or editing this task.
+    # If you do want to run it automatically, uncomment / modify the following task and ensure SSH is allowed:
+    # - name: Configure UFW
+    #   shell: |
+    #     ufw --force reset
+    #     ufw default deny incoming
+    #     ufw default allow outgoing
+    #     ufw allow ssh
+    #     ufw allow in on tailscale0
+    #     ufw allow from 192.168.1.0/24
+    #     ufw enable
+    #   args:
+    #     executable: /bin/bash
+
+  handlers:
+    - name: daemon-reload
+      command: systemctl daemon-reload
