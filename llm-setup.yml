@@ -1,0 +1,236 @@
+---
+- name: Set up Local LLM Host (vLLM + AnythingLLM + Tailscale)
+  hosts: localhost
+  become: true
+  vars:
+    username: "{{ lookup('env', 'USER') }}"
+    llm_root: "/home/{{ lookup('env', 'USER') }}/llm-stack"
+    vllm_model: "Qwen/Qwen2.5-7B-Instruct"
+    vllm_api_key: "token-local"
+    anythingllm_port: 3001
+    vllm_port: 8000
+    tailscale_authkey: ""   # Set your Tailscale reusable auth key here
+
+  tasks:
+    - name: Update system
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Install prerequisites
+      apt:
+        name:
+          - curl
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+          - software-properties-common
+          - docker.io
+          - docker-compose-plugin
+        state: present
+
+    - name: Add user to docker group
+      user:
+        name: "{{ username }}"
+        groups: docker
+        append: yes
+
+    # --- NVIDIA container runtime ---
+    - name: Add NVIDIA container toolkit repo
+      shell: |
+        curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+          gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit.gpg
+        curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+          tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+      args:
+        executable: /bin/bash
+
+    - name: Install NVIDIA container runtime
+      apt:
+        update_cache: yes
+        name: nvidia-container-toolkit
+        state: present
+
+    - name: Configure NVIDIA runtime
+      command: nvidia-ctk runtime configure --runtime=docker
+
+    - name: Restart Docker
+      service:
+        name: docker
+        state: restarted
+        enabled: yes
+
+    # --- Tailscale setup ---
+    - name: Add Tailscale APT repository
+      shell: |
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).noarmor.gpg | \
+          tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+        curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/$(lsb_release -cs).tailscale-keyring.list | \
+          tee /etc/apt/sources.list.d/tailscale.list >/dev/null
+      args:
+        executable: /bin/bash
+
+    - name: Install Tailscale
+      apt:
+        update_cache: yes
+        name: tailscale
+        state: present
+
+    - name: Enable and start Tailscale service
+      service:
+        name: tailscaled
+        state: started
+        enabled: yes
+
+    - name: Authenticate and bring Tailscale up (if auth key provided)
+      shell: |
+        tailscale up --authkey {{ tailscale_authkey }} --ssh --hostname local-llm-host
+      args:
+        executable: /bin/bash
+      when: tailscale_authkey != ""
+
+    # --- LLM stack setup ---
+    - name: Create directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ username }}"
+        group: "{{ username }}"
+        mode: '0755'
+      loop:
+        - "{{ llm_root }}"
+        - "{{ llm_root }}/models"
+        - "{{ llm_root }}/anythingllm"
+        - "{{ llm_root }}/anythingllm/data"
+
+    - name: Create AnythingLLM env file
+      copy:
+        dest: "{{ llm_root }}/anythingllm/.env"
+        owner: "{{ username }}"
+        content: |
+          STORAGE_DIR=/app/server/storage
+          PORT={{ anythingllm_port }}
+
+    - name: Create Docker Compose file
+      copy:
+        dest: "{{ llm_root }}/docker-compose.yml"
+        owner: "{{ username }}"
+        content: |
+          services:
+            vllm:
+              image: vllm/vllm-openai:latest
+              command:
+                - "vllm"
+                - "serve"
+                - "{{ vllm_model }}"
+                - "--dtype"; "auto"
+                - "--port"; "{{ vllm_port }}"
+                - "--api-key"; "{{ vllm_api_key }}"
+                - "--max-model-len"; "16000"  # Optimal context window for 3090 (24 GB)
+              environment:
+                - NVIDIA_VISIBLE_DEVICES=all
+              device_requests:
+                - driver: nvidia
+                  count: 1
+                  capabilities: [gpu]
+              ports:
+                - "127.0.0.1:{{ vllm_port }}:{{ vllm_port }}"
+              restart: unless-stopped
+              volumes:
+                - "{{ llm_root }}/models:/root/.cache/huggingface"
+
+            anythingllm:
+              image: mintplexlabs/anythingllm:latest
+              depends_on:
+                - vllm
+              ports:
+                - "127.0.0.1:{{ anythingllm_port }}:{{ anythingllm_port }}"
+              cap_add:
+                - SYS_ADMIN
+              environment:
+                - STORAGE_DIR=/app/server/storage
+              volumes:
+                - "{{ llm_root }}/anythingllm:/app/server/storage"
+                - "{{ llm_root }}/anythingllm/.env:/app/server/.env"
+              restart: unless-stopped
+
+    - name: Create systemd service for LLM stack
+      copy:
+        dest: /etc/systemd/system/llm-stack.service
+        content: |
+          [Unit]
+          Description=Local LLM Stack (vLLM + AnythingLLM)
+          After=docker.service
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          WorkingDirectory={{ llm_root }}
+          ExecStart=/usr/bin/docker compose up -d
+          ExecStop=/usr/bin/docker compose down
+          RemainAfterExit=yes
+          User={{ username }}
+          Group={{ username }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start LLM stack
+      systemd:
+        name: llm-stack.service
+        enabled: yes
+        state: started
+
+    # --- Optional RDP GUI ---
+    - name: Install xrdp and XFCE
+      apt:
+        name:
+          - xrdp
+          - xfce4
+          - xfce4-goodies
+        state: present
+
+    - name: Configure XRDP session
+      copy:
+        dest: /home/{{ username }}/.xsession
+        content: |
+          startxfce4
+      owner: "{{ username }}"
+      mode: '0644'
+
+    - name: Add xrdp to ssl-cert group
+      user:
+        name: xrdp
+        groups: ssl-cert
+        append: yes
+
+    - name: Enable xrdp service
+      service:
+        name: xrdp
+        state: started
+        enabled: yes
+
+    # --- Shell aliases for convenience ---
+    - name: Add LLM management aliases to .bashrc
+      lineinfile:
+        path: "/home/{{ username }}/.bashrc"
+        insertafter: EOF
+        line: "{{ item }}"
+      with_items:
+        - '# Local LLM aliases'
+        - "alias llm-up='cd ~/llm-stack && docker compose up -d'"
+        - "alias llm-down='cd ~/llm-stack && docker compose down'"
+        - "alias llm-logs='cd ~/llm-stack && docker compose logs -f'"
+
+    # --- Firewall rules for LAN + Tailscale only ---
+    - name: Configure UFW
+      shell: |
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow in on tailscale0
+        ufw allow from 192.168.1.0/24
+        ufw enable
+      args:
+        executable: /bin/bash
